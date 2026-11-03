@@ -116,7 +116,7 @@ final class AppModel {
     init(store: Store, presentsUI: Bool) {
         self.store = store
         self.presentsUI = presentsUI
-        privacyGuard = PrivacyGuard(presentsOverlay: presentsUI)
+        privacyGuard = PrivacyGuard(presentsOverlay: presentsUI, micRecoveryURL: store.micRecoveryURL)
         config = store.loadConfig()
         dataset = store.loadDataset()
         nextSampleID = (dataset.samples.map(\.id).max() ?? 0) + 1
@@ -131,6 +131,7 @@ final class AppModel {
 
     func start() {
         Log.app.notice("LidTap starting, data in \(self.store.directory.path, privacy: .public)")
+        privacyGuard.recoverMicAfterCrash()
         detector.lidAngle = { [imu] in imu.lidAngle }
         detector.onTap = { [weak self] event in
             DispatchQueue.main.async { self?.handle(event) }
@@ -142,7 +143,12 @@ final class AppModel {
             MainActor.assumeIsolated { self?.refreshStatus() }
         }
         if Set(dataset.samples.map(\.label)).count >= 2 { retrain() }
-        if CommandLine.arguments.contains("--test-hooks") { installTestHooks() }
+        // Any process can post distributed notifications, so the hooks only ever run against a separate test data
+        // directory, never your real calibration and settings.
+        if CommandLine.arguments.contains("--test-hooks") {
+            if ProcessInfo.processInfo.environment["LIDTAP_DATA_DIR"] != nil { installTestHooks() }
+            else { Log.app.error("--test-hooks ignored: it needs LIDTAP_DATA_DIR (a test data directory)") }
+        }
     }
 
     private func refreshStatus() {
@@ -368,6 +374,14 @@ final class AppModel {
         scheduleSave()
     }
 
+    /// Writes a pending dataset save now (on quit, so the last taps of a calibration aren't lost).
+    func flushSave() {
+        guard saveTask != nil else { return }
+        saveTask?.cancel()
+        saveTask = nil
+        store.save(dataset)
+    }
+
     private func scheduleSave() {
         saveTask?.cancel()
         let snapshot = dataset, store = store
@@ -421,11 +435,13 @@ final class AppModel {
 
     func startNoiseRecording(seconds: Double = 20) {
         guard var cal = calibration else { return }
-        cal.phase = .noise(until: Date().addingTimeInterval(seconds))
+        let until = Date().addingTimeInterval(seconds)
+        cal.phase = .noise(until: until)
         calibration = cal
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(seconds))
-            if case .noise = calibration?.phase { finishCalibration() }
+            // Only end the recording this timer started, not a newer one begun after a restart.
+            if case .noise(let u) = calibration?.phase, u == until { finishCalibration() }
         }
     }
 
@@ -457,6 +473,7 @@ final class AppModel {
 
     func clearData() {
         dataset.samples.removeAll()
+        discardTraining()
         report = nil
         model = nil
         activeKind = nil
@@ -487,6 +504,7 @@ final class AppModel {
         let labels = samples.map(\.label)
         let grid = dataset.grid
         guard Set(labels).count >= 2 else {
+            discardTraining()
             report = nil
             model = nil
             activeKind = nil
@@ -514,6 +532,12 @@ final class AppModel {
         }
     }
 
+    /// Makes any training still running in the background drop its result (it learned from data that is gone).
+    private func discardTraining() {
+        trainGeneration += 1
+        isTraining = false
+    }
+
     private func refitActiveModel() {
         guard let report else { return }
         let kind = ModelKind(rawValue: config.modelChoice) ?? report.best
@@ -521,9 +545,13 @@ final class AppModel {
         let samples = dataset.samples.filter(isUsable)
         let X = samples.map { features[$0.id] ?? Features.extract(g: $0.g, a: $0.a) }
         let labels = samples.map(\.label)
+        guard Set(labels).count >= 2 else { return }
+        let generation = trainGeneration
         Task.detached(priority: .userInitiated) {
             let model = ZoneModel(kind: kind, X: X, labels: labels, augmented: samples.map { Augment.variants(of: $0) })
             await MainActor.run {
+                // A retrain or a data change since then wins over this refit.
+                guard generation == self.trainGeneration else { return }
                 self.model = model
                 self.activeKind = kind
             }

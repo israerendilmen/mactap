@@ -17,14 +17,24 @@ final class PrivacyGuard {
     @ObservationIgnored let presentsOverlay: Bool
     @ObservationIgnored var muteMic = true
     @ObservationIgnored var stopCamera = true
-    @ObservationIgnored private let muter = MicMuter()
+    @ObservationIgnored private let muter: MicMuter
     @ObservationIgnored private var cameraTarget: MeetingTarget?
     @ObservationIgnored private var previousApp: NSRunningApplication?
     @ObservationIgnored private var reassertTimer: Timer?
     @ObservationIgnored private var overlay: PrivacyOverlayController?
     @ObservationIgnored private var cameraTask: Task<Void, Never>?
 
-    init(presentsOverlay: Bool = true) { self.presentsOverlay = presentsOverlay }
+    /// `micRecoveryURL` keeps the microphones' original settings on disk while muted (see `recoverMicAfterCrash`).
+    init(presentsOverlay: Bool = true, micRecoveryURL: URL? = nil) {
+        self.presentsOverlay = presentsOverlay
+        muter = MicMuter(recoveryURL: micRecoveryURL)
+    }
+
+    /// Unmutes microphones left muted by a previous run that crashed or was force quit while the guard was on.
+    func recoverMicAfterCrash() {
+        let n = muter.recoverAfterCrash()
+        if n > 0 { Log.action.notice("Restored \(n) microphone(s) left muted by a previous run") }
+    }
 
     func toggle() { isActive ? release() : engage() }
 
@@ -59,18 +69,23 @@ final class PrivacyGuard {
             guard Cameras.anyRunning() else { camera = .notInUse; return }
             guard Permissions.accessibility else { camera = .needsAccessibility; return }
             guard let target = await Meetings.locate() else { camera = .stillOn(nil); return }
+            // Released while we were looking for the meeting: don't switch the camera off behind the user's back.
+            guard isActive, !Task.isCancelled else { return }
             await Meetings.toggleCamera(target)
+            // The shortcut has been sent: remember it now, so a release during the check below toggles it back.
+            cameraTarget = target
             for _ in 0..<20 {
                 try? await Task.sleep(for: .milliseconds(150))
                 if !Cameras.anyRunning() { break }
             }
             guard isActive else { return }
             if Cameras.anyRunning() {
+                // The shortcut didn't take, so toggling again on release would turn the camera *off*.
+                cameraTarget = nil
                 camera = .stillOn(target.name)
                 Log.action.error("Camera still on after toggling \(target.name, privacy: .public)")
             } else {
                 Log.action.notice("Camera turned off in \(target.name, privacy: .public)")
-                cameraTarget = target
                 camera = .turnedOff(target.name)
             }
         }

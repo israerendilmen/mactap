@@ -13,9 +13,29 @@ final class MicMuter {
         let volumes: [(AudioObjectPropertyElement, Float32)]
     }
 
+    /// What `recoveryURL` holds: each device's settings before muting, keyed by its UID (device IDs change between launches).
+    private struct Record: Codable {
+        let uid: String
+        let mute: UInt32?
+        let volumes: [Volume]
+        struct Volume: Codable { let element: UInt32; let value: Float32 }
+    }
+
     private var saved: [Saved] = []
     private(set) var mutedCount = 0
     var isEngaged: Bool { !saved.isEmpty }
+    /// While muted, the original settings are also kept here, so a crash or force quit can't leave the mic silenced for good.
+    let recoveryURL: URL?
+
+    init(recoveryURL: URL? = nil) { self.recoveryURL = recoveryURL }
+
+    private static func uid(_ id: AudioDeviceID) -> String? {
+        var addr = address(kAudioDevicePropertyDeviceUID)
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &uid) == noErr, let uid else { return nil }
+        return uid.takeRetainedValue() as String
+    }
 
     private static func address(_ selector: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
                                 _ element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> AudioObjectPropertyAddress {
@@ -44,31 +64,14 @@ final class MicMuter {
     /// Mutes all inputs. Returns how many devices were silenced.
     @discardableResult
     func mute() -> Int {
-        if saved.isEmpty {
-            for id in Self.inputDevices() {
-                var muteAddr = Self.address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeInput)
-                var mute: UInt32?
-                if Self.settable(id, &muteAddr) {
-                    var v: UInt32 = 0, size = UInt32(MemoryLayout<UInt32>.size)
-                    if AudioObjectGetPropertyData(id, &muteAddr, 0, nil, &size, &v) == noErr { mute = v }
-                }
-                var volumes: [(AudioObjectPropertyElement, Float32)] = []
-                for element in [kAudioObjectPropertyElementMain] + (1...8).map({ AudioObjectPropertyElement($0) }) {
-                    var volAddr = Self.address(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeInput, element)
-                    guard Self.settable(id, &volAddr) else { continue }
-                    var v: Float32 = 0, size = UInt32(MemoryLayout<Float32>.size)
-                    if AudioObjectGetPropertyData(id, &volAddr, 0, nil, &size, &v) == noErr { volumes.append((element, v)) }
-                }
-                if mute != nil || !volumes.isEmpty { saved.append(Saved(device: id, mute: mute, volumes: volumes)) }
-            }
-        }
         reassert()
-        mutedCount = saved.count
         return mutedCount
     }
 
-    /// Re-applies the mute (meeting apps with automatic gain may raise the volume again).
+    /// Re-applies the mute (meeting apps with automatic gain may raise the volume again), including on any
+    /// microphone plugged in since the guard went on (AirPods, a USB headset), which is restored afterwards too.
     func reassert() {
+        if saveNewDevices() { writeRecovery() }
         for s in saved {
             if s.mute != nil {
                 var a = Self.address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeInput)
@@ -81,22 +84,75 @@ final class MicMuter {
                 AudioObjectSetPropertyData(s.device, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &zero)
             }
         }
+        mutedCount = saved.count
+    }
+
+    /// Records the current mute and volume of every input device not saved yet. Returns whether any was added.
+    private func saveNewDevices() -> Bool {
+        let before = saved.count
+        let known = Set(saved.map(\.device))
+        for id in Self.inputDevices() where !known.contains(id) {
+            var muteAddr = Self.address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeInput)
+            var mute: UInt32?
+            if Self.settable(id, &muteAddr) {
+                var v: UInt32 = 0, size = UInt32(MemoryLayout<UInt32>.size)
+                if AudioObjectGetPropertyData(id, &muteAddr, 0, nil, &size, &v) == noErr { mute = v }
+            }
+            var volumes: [(AudioObjectPropertyElement, Float32)] = []
+            for element in [kAudioObjectPropertyElementMain] + (1...8).map({ AudioObjectPropertyElement($0) }) {
+                var volAddr = Self.address(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeInput, element)
+                guard Self.settable(id, &volAddr) else { continue }
+                var v: Float32 = 0, size = UInt32(MemoryLayout<Float32>.size)
+                if AudioObjectGetPropertyData(id, &volAddr, 0, nil, &size, &v) == noErr { volumes.append((element, v)) }
+            }
+            if mute != nil || !volumes.isEmpty { saved.append(Saved(device: id, mute: mute, volumes: volumes)) }
+        }
+        return saved.count > before
+    }
+
+    private func writeRecovery() {
+        guard let recoveryURL else { return }
+        let records = saved.compactMap { s in
+            Self.uid(s.device).map { Record(uid: $0, mute: s.mute, volumes: s.volumes.map { Record.Volume(element: $0.0, value: $0.1) }) }
+        }
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        try? data.write(to: recoveryURL, options: .atomic)
+    }
+
+    /// Puts back the microphones a previous run muted but never restored (it crashed or was force quit).
+    /// Returns how many devices were restored.
+    @discardableResult
+    func recoverAfterCrash() -> Int {
+        guard let recoveryURL, let data = try? Data(contentsOf: recoveryURL) else { return 0 }
+        defer { try? FileManager.default.removeItem(at: recoveryURL) }
+        guard let records = try? JSONDecoder().decode([Record].self, from: data) else { return 0 }
+        let byUID = Dictionary(records.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
+        var restored = 0
+        for id in Self.inputDevices() {
+            guard let uid = Self.uid(id), let r = byUID[uid] else { continue }
+            Self.apply(Saved(device: id, mute: r.mute, volumes: r.volumes.map { ($0.element, $0.value) }))
+            restored += 1
+        }
+        return restored
+    }
+
+    private static func apply(_ s: Saved) {
+        for (element, value) in s.volumes {
+            var a = address(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeInput, element)
+            var v = value
+            AudioObjectSetPropertyData(s.device, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &v)
+        }
+        if var m = s.mute {
+            var a = address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeInput)
+            AudioObjectSetPropertyData(s.device, &a, 0, nil, UInt32(MemoryLayout<UInt32>.size), &m)
+        }
     }
 
     func restore() {
-        for s in saved {
-            for (element, value) in s.volumes {
-                var a = Self.address(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeInput, element)
-                var v = value
-                AudioObjectSetPropertyData(s.device, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &v)
-            }
-            if var m = s.mute {
-                var a = Self.address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeInput)
-                AudioObjectSetPropertyData(s.device, &a, 0, nil, UInt32(MemoryLayout<UInt32>.size), &m)
-            }
-        }
+        for s in saved { Self.apply(s) }
         saved = []
         mutedCount = 0
+        if let recoveryURL { try? FileManager.default.removeItem(at: recoveryURL) }
     }
 }
 

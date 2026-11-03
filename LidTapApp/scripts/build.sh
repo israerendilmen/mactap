@@ -42,7 +42,11 @@ if [ ! -f "$BUILD/AppIcon.icns" ]; then
   iconutil -c icns "$BUILD/AppIcon.iconset" -o "$BUILD/AppIcon.icns"
 fi
 cp "$BUILD/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-codesign --force --sign - --identifier dev.lidtap.LidTap "$APP"
+# Hardened Runtime: no injected dylibs, no debugger attach, no unsigned code. Set LIDTAP_SIGN_ID to a
+# "Developer ID Application: …" identity to sign for distribution (then notarize with notarytool).
+if [ -n "$LIDTAP_SIGN_ID" ]; then STAMP="--timestamp"; else STAMP="--timestamp=none"; fi  # notarization needs a secure timestamp
+codesign --force --options runtime "$STAMP" --entitlements Resources/LidTap.entitlements \
+  --sign "${LIDTAP_SIGN_ID:--}" --identifier dev.lidtap.LidTap "$APP"
 
 if [ "$MODE" != "--no-install" ]; then
   DEST="$HOME/Applications/LidTap.app"

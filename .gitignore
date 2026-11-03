@@ -8,3 +8,5 @@ data/
 # Build output and generated toolchain workaround
 LidTapApp/build/
 LidTapApp/scripts/toolchain-fix/
+# graphify knowledge-graph output (local)
+graphify-out/

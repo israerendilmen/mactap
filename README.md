@@ -105,8 +105,9 @@ LidTap is not affiliated with or endorsed by Apple.
 LidTapApp/scripts/build.sh
 ```
 
-It compiles with `swiftc`, assembles `LidTapApp/build/LidTap.app`, signs it ad hoc and installs it to
-`~/Applications`. `--no-install` skips the install.
+It compiles with `swiftc`, assembles `LidTapApp/build/LidTap.app`, signs it ad hoc with the Hardened Runtime and
+installs it to `~/Applications`. `--no-install` skips the install. To sign for distribution, set
+`LIDTAP_SIGN_ID="Developer ID Application: …"` and notarize the result with `xcrun notarytool`.
 
 **Run the tests:**
 
@@ -114,7 +115,8 @@ It compiles with `swiftc`, assembles `LidTapApp/build/LidTap.app`, signs it ad h
 LidTapApp/scripts/test.sh
 ```
 
-That runs the ML, detector, app-logic and UI suites with no side effects. `hardware`, `actions`,
+That runs the ML, detector, app-logic and UI suites with no side effects. The Python prototype has its own
+hardware-free tests: `python -m unittest tests.test_prototype` from the repo root. `hardware`, `actions`,
 `guard` and `e2e` suites drive the real system (switch Spaces, mute the mic, open apps), so run
 them only when you aren't using the Mac.
 

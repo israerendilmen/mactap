@@ -1,8 +1,10 @@
 """Application state: detector config, labelled dataset, calibration flow, model and actions."""
 
 import json
+import math
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -27,26 +29,54 @@ DEFAULT_CFG = {
 }
 
 
+# Allowed range for each numeric setting (keeps NaN, infinities and nonsense out of the detector).
+CFG_RANGES = {"k": (1.0, 50.0), "min_thresh": (0.05, 100.0), "refractory": (0.05, 5.0),
+              "gate_s": (0.0, 5.0), "reject_factor": (0.1, 50.0)}
+ZONE_RE = re.compile(r"z\d{1,3}")
+
+
+def _number(value, lo, hi, name):
+    v = float(value)
+    if not math.isfinite(v) or not lo <= v <= hi:
+        raise ValueError(f"{name} must be between {lo} and {hi}")
+    return v
+
+
+def _load_json(path):
+    """Reads a JSON file; an unreadable one is moved aside instead of crashing start-up."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        if path.exists():
+            os.replace(path, path.with_suffix(path.suffix + f".corrupt-{int(time.time())}"))
+        return None
+
+
 def _atomic_write(path, text):
+    """Owner-only (0600): config.json holds shell commands that run on a tap, and dataset.json your taps."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)  # an older tmp file may still carry wider permissions
     os.replace(tmp, path)
 
 
 class App:
     def __init__(self, data_dir):
         self.dir = Path(data_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
+        if not self.dir.exists():
+            self.dir.mkdir(parents=True, mode=0o700)  # never re-permission a folder the user pointed us at
         self.lock = threading.RLock()
         self.cfg = dict(DEFAULT_CFG)
         cfg_path = self.dir / "config.json"
-        if cfg_path.exists():
-            self.cfg.update(json.loads(cfg_path.read_text()))
+        if cfg_path.exists() and isinstance(saved := _load_json(cfg_path), dict):
+            self.cfg.update(saved)
         self.grid = {"rows": 3, "cols": 3}
         self.samples = []
         ds_path = self.dir / "dataset.json"
-        if ds_path.exists():
-            ds = json.loads(ds_path.read_text())
+        ds = _load_json(ds_path) if ds_path.exists() else None
+        if isinstance(ds, dict) and "grid" in ds and "samples" in ds:
             self.grid = ds["grid"]
             self.samples = ds["samples"]
             for s in self.samples:
@@ -63,7 +93,15 @@ class App:
         if len({s["label"] for s in self.samples}) >= 2:
             self.train()
 
+    def _train_in_background(self):
+        try:
+            self.train()
+        except ValueError:
+            pass  # e.g. a 1-zone grid with no noise examples: nothing to learn yet
+
     def start(self):
+        if sensors.listen_access() != "granted":
+            sensors.request_listen_access()  # shows the Input Monitoring prompt once; the sensors need it on some Macs
         self.sensors.start()
         self.detector.start()
 
@@ -93,10 +131,13 @@ class App:
                 self.calib["pos"] += 1
                 if self.calib["pos"] >= len(self.calib["seq"]):
                     self.mode, self.calib = "idle", None
-                    threading.Thread(target=self.train, daemon=True).start()
-            elif self.mode == "negatives":
+                    threading.Thread(target=self._train_in_background, daemon=True).start()
+            elif self.mode == "negatives" and time.time() < self.neg_until:
                 self._add_sample(ev, g, a, model.NOISE)
                 ev["outcome"], ev["label"] = "recorded", model.NOISE
+            elif self.mode == "negatives":
+                self.mode = "idle"  # time is up even if no GUI polled status()
+                ev["outcome"] = "detected"
             elif self.model:
                 pred = self.model.predict(features.extract(g, a), self.cfg["reject_factor"])
                 ev["pred"] = pred
@@ -118,9 +159,9 @@ class App:
 
     def _run_action(self, label):
         cmd = self.cfg["actions"].get(label, "").strip()
-        if not cmd:
-            return None
         i = model.zone_index(label)
+        if not cmd or i is None:
+            return None
         cmd = cmd.replace("{zone}", str(i + 1))
         subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return cmd
@@ -133,14 +174,16 @@ class App:
 
     def set_config(self, body):
         with self.lock:
-            for key in ("k", "min_thresh", "refractory", "gate_s", "reject_factor"):
+            for key, (lo, hi) in CFG_RANGES.items():
                 if key in body:
-                    self.cfg[key] = float(body[key])
+                    self.cfg[key] = _number(body[key], lo, hi, key)
             for key in ("gating", "actions_enabled"):
                 if key in body:
                     self.cfg[key] = bool(body[key])
             if "actions" in body:
-                self.cfg["actions"] = {str(k): str(v) for k, v in body["actions"].items()}
+                if not isinstance(body["actions"], dict):
+                    raise ValueError("actions must be an object")
+                self.cfg["actions"] = {str(k): str(v) for k, v in body["actions"].items() if ZONE_RE.fullmatch(str(k))}
             if "model_kind" in body and (body["model_kind"] in model.KINDS or body["model_kind"] == "auto"):
                 self.cfg["model_kind"] = body["model_kind"]
                 self._fit_model()
@@ -179,7 +222,7 @@ class App:
     def negatives_start(self, body):
         with self.lock:
             self.mode = "negatives"
-            self.neg_until = time.time() + float(body.get("seconds", 30))
+            self.neg_until = time.time() + _number(body.get("seconds", 30), 1, 600, "seconds")
 
     def undo(self):
         with self.lock:
@@ -194,6 +237,10 @@ class App:
         with self.lock:
             self.samples = [s for s in self.samples if s["label"] != label]
             self.save_dataset()
+            if len({s["label"] for s in self.samples}) < 2:
+                self.model, self.report = None, None
+        if self.model:
+            self.train()  # don't keep acting on a model that still knows the deleted taps
 
     def clear(self):
         with self.lock:
@@ -219,7 +266,7 @@ class App:
         if not self.report:
             return
         kind = self.cfg["model_kind"]
-        if kind == "auto":
+        if kind == "auto" or kind not in model.KINDS:
             kind = self.report["best"]
         self.model = model.ZoneModel(kind, self.samples)
         self.report["active"] = kind
@@ -247,7 +294,7 @@ class App:
                 "model": None,
             }
             if self.model and self.report:
-                acc = next(r["acc"]["Full grid"] for r in self.report["models"] if r["kind"] == self.model.kind)
+                acc = next((r["acc"]["Full grid"] for r in self.report["models"] if r["kind"] == self.model.kind), None)
                 st["model"] = {"kind": self.model.kind, "name": model.KINDS[self.model.kind][0], "acc": acc,
                                "trained_at": self.report["trained_at"]}
             if self.calib:

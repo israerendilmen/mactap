@@ -49,6 +49,7 @@ _cf.CFNumberCreate.argtypes = [V, ctypes.c_int, V]
 _cf.CFNumberGetValue.argtypes = [V, ctypes.c_int, V]
 _cf.CFRunLoopGetCurrent.restype = V
 _cf.CFRunLoopRunInMode.argtypes = [V, ctypes.c_double, ctypes.c_bool]
+_cf.CFRelease.argtypes = [V]
 _cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
 _cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_uint32]
 _libc.mach_absolute_time.restype = ctypes.c_uint64
@@ -104,11 +105,14 @@ def _cfnum(value):
 
 
 def _int_prop(service, key):
-    ref = _io.IORegistryEntryCreateCFProperty(service, _cfstr(key), None, 0)
+    name = _cfstr(key)
+    ref = _io.IORegistryEntryCreateCFProperty(service, name, None, 0)
+    _cf.CFRelease(name)
     if not ref:
         return None
     v = ctypes.c_long()
     _cf.CFNumberGetValue(ref, 4, ctypes.byref(v))
+    _cf.CFRelease(ref)
     return v.value
 
 
@@ -167,7 +171,10 @@ class Sensors:
         for driver in _services(b"AppleSPUHIDDriver"):
             for key, value in (("SensorPropertyReportingState", 1), ("SensorPropertyPowerState", 1),
                                ("ReportInterval", self._interval)):
-                _io.IORegistryEntrySetCFProperty(driver, _cfstr(key), _cfnum(value))
+                name, num = _cfstr(key), _cfnum(value)
+                _io.IORegistryEntrySetCFProperty(driver, name, num)
+                _cf.CFRelease(name)
+                _cf.CFRelease(num)
         loop = _cf.CFRunLoopGetCurrent()
         lid = None
         for dev in _services(b"AppleSPUHIDDevice"):

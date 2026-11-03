@@ -35,11 +35,6 @@ def onset(gm):
     return int(np.argmax(span >= 0.25 * peak))
 
 
-def peak_index(g):
-    gm = np.linalg.norm(g, axis=1)
-    return int(np.argmax(gm[: TRIG + 64]))
-
-
 def extract(g, a):
     g = np.asarray(g, float)
     a = np.asarray(a, float)

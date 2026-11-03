@@ -16,6 +16,14 @@ STATIC = Path(__file__).parent / "static"
 TOKEN = secrets.token_urlsafe(24)
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8"}
+MAX_BODY = 1 << 20  # commands are tiny; refuse anything bigger
+# The page holds the token, so it must not be framed by another site (clickjacking).
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    "Referrer-Policy": "no-referrer",
+}
 
 
 def _round(rows, nd=3):
@@ -39,6 +47,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
@@ -60,10 +70,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self._local() or self.headers.get("X-Token") != TOKEN:
+        if not self._local() or not secrets.compare_digest(self.headers.get("X-Token") or "", TOKEN):
+            self.close_connection = True  # the unread body would corrupt the next request on this connection
             return self._send(403, {"error": "forbidden"})
-        n = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(n) or b"{}")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return self._send(400, {"error": "bad Content-Length"})
+        if not 0 <= n <= MAX_BODY:
+            self.close_connection = True
+            return self._send(413, {"error": "body too large"})
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._send(400, {"error": "body must be JSON"})
+        if not isinstance(body, dict):
+            return self._send(400, {"error": "body must be a JSON object"})
         app = self.app
         cmd = self.path.split("?", 1)[0].removeprefix("/api/")
         handlers = {
@@ -73,7 +96,7 @@ class Handler(BaseHTTPRequestHandler):
             "stop": app.stop,
             "undo": app.undo,
             "clear": app.clear,
-            "delete_label": lambda: app.delete_label(body["label"]),
+            "delete_label": lambda: app.delete_label(str(body["label"])),
             "train": app.train,
         }
         if cmd not in handlers:
@@ -92,6 +115,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
         self.end_headers()
         self.close_connection = True
         app = self.app

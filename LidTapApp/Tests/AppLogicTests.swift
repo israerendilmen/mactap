@@ -336,6 +336,35 @@ func appLogicTests() {
         T.expect(h.app.dataset.samples.isEmpty && !h.app.isTrained, "clear all")
     }
 
+    T.run("clearing data while a model trains doesn't bring the old model back") {
+        let h = AppHarness(name: "clear-race")
+        h.app.retrain()
+        T.expect(h.app.isTraining, "training did not start")
+        h.app.clearData()
+        T.expect(!h.app.isTraining, "still marked as training after clear")
+        T.sleep(3)  // long enough for the abandoned training to finish
+        T.expect(!h.app.isTrained && h.app.report == nil, "model trained on deleted taps came back")
+    }
+
+    T.run("quitting writes taps that were still waiting to be saved") {
+        let h = AppHarness(name: "flush")
+        h.app.startCalibration()
+        h.tap(h.app.calibration!.target!)
+        h.app.flushSave()  // what applicationWillTerminate does, before the 400 ms debounce
+        let again = AppModel(store: Store(directory: h.dir), presentsUI: false)
+        T.expect(again.dataset.samples.count == 61, "saved samples \(again.dataset.samples.count)")
+    }
+
+    T.run("a stale noise timer doesn't end a newer noise recording") {
+        let h = AppHarness(name: "noise-timer")
+        h.app.startCalibration()
+        h.app.startNoiseRecording(seconds: 0.4)
+        h.app.startNoiseRecording(seconds: 30)  // restarted: the first timer must not finish this one
+        T.sleep(0.8)
+        if case .noise = h.app.calibration?.phase {} else { T.fail("phase \(String(describing: h.app.calibration?.phase))") }
+        h.app.endCalibration()
+    }
+
     T.run("corrupt files are moved aside, not overwritten") {
         let dir = T.tempDir("corrupt")
         try! "{ this is not json".write(to: dir.appendingPathComponent("dataset.json"), atomically: true, encoding: .utf8)

@@ -74,6 +74,8 @@ struct Store {
     var configURL: URL { directory.appendingPathComponent("config.json") }
     var datasetURL: URL { directory.appendingPathComponent("dataset.json") }
     var statusURL: URL { directory.appendingPathComponent("status.json") }
+    /// Microphone settings saved while Privacy Guard has them muted (removed once restored).
+    var micRecoveryURL: URL { directory.appendingPathComponent("mic-restore.json") }
 
     /// A file that exists but can't be read is moved aside (never silently replaced by the next save).
     private func quarantine(_ url: URL) {
